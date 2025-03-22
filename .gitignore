@@ -39,4 +39,11 @@ Thumbs.db
 *.csv
 *.tsv
 *.xlsx
-*.xls 
+*.xls
+
+# Exception for data directory
+!data/
+!data/**/*.csv
+!data/**/*.tsv
+!data/**/*.xlsx
+!data/**/*.xls 
