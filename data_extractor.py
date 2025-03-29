@@ -9,7 +9,11 @@ import time
 import concurrent.futures
 import math
 
-class OmicsExtractor:
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+
+class DataExtractor:
     def __init__(self, data_dir):
         self.data_dir = data_dir
         self.clorec_dir = os.path.join(data_dir, "colorec/omics_data")
@@ -308,12 +312,46 @@ class OmicsExtractor:
             "rnaseq": rnaseq,
             "scnv": scnv
         }
+    
+    def preprocess_omics(self):
+        """
+        Scale all omics data for both cancer types.
+        Returns scaled DataFrames with preserved patient IDs.
+        """
+        processed_data = {}
         
-if __name__ == "__main__":
-    extractor = OmicsExtractor("./data")
-    extractor.convert_to_csv()
-    extractor.get_biogrid_interactions()
-    extractor.harmonize_omics("colorectal")
-    extractor.harmonize_omics("pancreatic")
+        for cancer_type in ["colorectal", "pancreatic"]:
+            cancer_data = self.harmonized_colorec if cancer_type == "colorectal" else self.harmonized_panc
+            processed_cancer = {}
+            
+            # Process each omics data type
+            for omics_type, df in cancer_data.items():
+                if omics_type == "clinical":
+                    # Preserve clinical data for later survival analysis
+                    processed_cancer[omics_type] = df.copy()
+                    continue
+                    
+                # Save patient IDs
+                patient_ids = df["patient_id"].values
+                
+                # Get features for scaling
+                features = df.drop("patient_id", axis=1)
+                
+                # Scale the features
+                scaler = StandardScaler()
+                scaled_features = scaler.fit_transform(features)
+                
+                # Create new DataFrame with scaled values
+                scaled_df = pd.DataFrame(scaled_features, columns=features.columns)
+                scaled_df.insert(0, "patient_id", patient_ids)
+                
+                processed_cancer[omics_type] = scaled_df
+                
+            processed_data[cancer_type] = processed_cancer
+        
+        return processed_data
+
+
+        
 
     

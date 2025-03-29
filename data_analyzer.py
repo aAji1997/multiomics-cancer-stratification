@@ -4,9 +4,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import networkx as nx
-from omics_extractor import OmicsExtractor
+from data_extractor import DataExtractor
 
-class OmicsAnalyzer(OmicsExtractor):
+class OmicsAnalyzer(DataExtractor):
     def __init__(self, data_dir):
         super().__init__(data_dir)
 
