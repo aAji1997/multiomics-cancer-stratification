@@ -13,9 +13,9 @@ class OmicsAnalyzer(DataExtractor):
     def initial_exploration(self, cancer_type):
         print(f"Initial exploration of {cancer_type} omics data:")
         # get the methylation data
-        if cancer_type == "colorectal":
+        if cancer_type == "colorec":
             methylation = self.harmonized_colorec["methylation"]
-        elif cancer_type == "pancreatic":
+        elif cancer_type == "panc":
             methylation = self.harmonized_panc["methylation"]
         # get the number of genes present(columns)
         num_genes = len(methylation.columns) - 1
@@ -28,9 +28,9 @@ class OmicsAnalyzer(DataExtractor):
         print(f"Number of unique patients in {cancer_type} methylation data: {num_patients}")
 
         # get the miRNA
-        if cancer_type == "colorectal":
+        if cancer_type == "colorec":
             miRNA = self.harmonized_colorec["miRNA"]
-        elif cancer_type == "pancreatic":
+        elif cancer_type == "panc":
             miRNA = self.harmonized_panc["miRNA"]
         # get the number of miRNAs present(columns)
         num_miRNAs = len(miRNA.columns) - 1
@@ -43,9 +43,9 @@ class OmicsAnalyzer(DataExtractor):
         print(f"Number of unique patients in {cancer_type} miRNA data: {num_patients}")
 
         # get the rnaseq data
-        if cancer_type == "colorectal":
+        if cancer_type == "colorec":
             rnaseq = self.harmonized_colorec["rnaseq"]
-        elif cancer_type == "pancreatic":
+        elif cancer_type == "panc":
             rnaseq = self.harmonized_panc["rnaseq"]
         # get the number of RNA sequences present(columns)
         num_rnaseq = len(rnaseq.columns) - 1
@@ -58,9 +58,9 @@ class OmicsAnalyzer(DataExtractor):
         print(f"Number of unique patients in {cancer_type} rnaseq data: {num_patients}")
 
         # get the scnv data
-        if cancer_type == "colorectal":
+        if cancer_type == "colorec":
             scnv = self.harmonized_colorec["scnv"]
-        elif cancer_type == "pancreatic":
+        elif cancer_type == "panc":
             scnv = self.harmonized_panc["scnv"]
         # get the number of SCNV present(columns)
         num_scnv = len(scnv.columns) - 1
@@ -73,13 +73,13 @@ class OmicsAnalyzer(DataExtractor):
         print(f"Number of unique patients in {cancer_type} scnv data: {num_patients}")
 
     def harmonize_omics(self, cancer_type):
-        if cancer_type == "colorectal":
+        if cancer_type == "colorec":
             clinical = self.colorec_omics["clinical"]
             methylation = self.colorec_omics["methylation"]
             miRNA = self.colorec_omics["miRNA"]
             rnaseq = self.colorec_omics["rnaseq"]
             scnv = self.colorec_omics["scnv"]
-        elif cancer_type == "pancreatic":
+        elif cancer_type == "panc":
             clinical = self.panc_omics["clinical"]
             methylation = self.panc_omics["methylation"]
             miRNA = self.panc_omics["miRNA"]
@@ -111,11 +111,11 @@ class OmicsAnalyzer(DataExtractor):
     def visualize_interaction_network(self, cancer_type, max_edges=500, layout='spring', figsize=(12, 10)):
         # Determine the appropriate file path based on cancer type
         if cancer_type == 'colorec':
-            interaction_file = os.path.join(self.colorec_interaction_dir, "colorectal_biogrid_interactions.csv")
-            title = "Colorectal Cancer Gene Interaction Network"
+            interaction_file = os.path.join(self.colorec_interaction_dir, "colorec_biogrid_interactions.csv")
+            title = "colorec Cancer Gene Interaction Network"
         elif cancer_type == 'panc':
-            interaction_file = os.path.join(self.panc_interaction_dir, "pancreatic_biogrid_interactions.csv")
-            title = "Pancreatic Cancer Gene Interaction Network"
+            interaction_file = os.path.join(self.panc_interaction_dir, "panc_biogrid_interactions.csv")
+            title = "panc Cancer Gene Interaction Network"
         else:
             raise ValueError("cancer_type must be either 'colorec' or 'panc'")
         
@@ -273,23 +273,23 @@ class OmicsAnalyzer(DataExtractor):
         Create an informative heatmap of methylation data with clustering and annotations.
         
         Args:
-            cancer_type: Either "colorectal" or "pancreatic"
+            cancer_type: Either "colorec" or "panc"
             n_top_genes: Number of most variable genes to display (default: 50)
             cluster_rows: Whether to cluster patients (rows) (default: False)
             cluster_cols: Whether to cluster genes (columns) (default: True)
             figsize: Figure size as (width, height) tuple (default: (16, 10))
             cmap: Colormap to use (default: 'coolwarm')
         """
-        if cancer_type == "colorectal" or cancer_type == "colorec":
+        if cancer_type == "colorec" or cancer_type == "colorec":
             methylation = self.harmonized_colorec["methylation"]
             clinical = self.harmonized_colorec["clinical"]
-            title_prefix = "Colorectal"
-        elif cancer_type == "pancreatic" or cancer_type == "panc":
+            title_prefix = "colorec"
+        elif cancer_type == "panc" or cancer_type == "panc":
             methylation = self.harmonized_panc["methylation"]
             clinical = self.harmonized_panc["clinical"]
-            title_prefix = "Pancreatic"
+            title_prefix = "panc"
         else:
-            raise ValueError("cancer_type must be either 'colorectal'/'colorec' or 'pancreatic'/'panc'")
+            raise ValueError("cancer_type must be either 'colorec'/'colorec' or 'panc'/'panc'")
         
         print(f"Processing methylation data for {title_prefix} cancer...")
         
@@ -399,7 +399,7 @@ class OmicsAnalyzer(DataExtractor):
         Create an informative heatmap of gene-level mRNA expression from RNA-seq data with clustering and annotations.
         
         Args:
-            cancer_type: Either "colorectal" or "pancreatic"
+            cancer_type: Either "colorec" or "panc"
             n_top_genes: Number of most variable genes to display (default: 50)
             cluster_rows: Whether to cluster patients (rows) (default: False)
             cluster_cols: Whether to cluster genes (columns) (default: True)
@@ -407,16 +407,16 @@ class OmicsAnalyzer(DataExtractor):
             cmap: Colormap to use (default: 'viridis')
             log_transform: Whether to apply log2 transformation to the expression data (default: True)
         """
-        if cancer_type == "colorectal" or cancer_type == "colorec":
+        if cancer_type == "colorec" or cancer_type == "colorec":
             rnaseq = self.harmonized_colorec["rnaseq"]
             clinical = self.harmonized_colorec["clinical"]
-            title_prefix = "Colorectal"
-        elif cancer_type == "pancreatic" or cancer_type == "panc":
+            title_prefix = "colorec"
+        elif cancer_type == "panc" or cancer_type == "panc":
             rnaseq = self.harmonized_panc["rnaseq"]
             clinical = self.harmonized_panc["clinical"]
-            title_prefix = "Pancreatic"
+            title_prefix = "panc"
         else:
-            raise ValueError("cancer_type must be either 'colorectal'/'colorec' or 'pancreatic'/'panc'")
+            raise ValueError("cancer_type must be either 'colorec'/'colorec' or 'panc'/'panc'")
         
         print(f"Processing RNA-seq data for {title_prefix} cancer...")
         
@@ -553,7 +553,7 @@ class OmicsAnalyzer(DataExtractor):
         Create an informative heatmap of different omics data types with clustering and annotations.
         
         Args:
-            cancer_type: Either "colorectal"/"colorec" or "pancreatic"/"panc"
+            cancer_type: Either "colorec"/"colorec" or "panc"/"panc"
             data_type: Type of omics data to visualize ('methylation', 'rnaseq', or 'scnv')
             n_top_genes: Number of most variable genes to display (default: 50)
             cluster_rows: Whether to cluster patients (rows) (default: False)
@@ -563,16 +563,16 @@ class OmicsAnalyzer(DataExtractor):
             log_transform: Whether to apply log2 transformation to the expression data (default: True, only applies to rnaseq)
         """
         # Validate cancer type
-        if cancer_type in ["colorectal", "colorec"]:
+        if cancer_type in ["colorec", "colorec"]:
             omics_data = self.harmonized_colorec
             clinical = self.harmonized_colorec["clinical"]
-            title_prefix = "Colorectal"
-        elif cancer_type in ["pancreatic", "panc"]:
+            title_prefix = "colorec"
+        elif cancer_type in ["panc", "panc"]:
             omics_data = self.harmonized_panc
             clinical = self.harmonized_panc["clinical"]
-            title_prefix = "Pancreatic"
+            title_prefix = "panc"
         else:
-            raise ValueError("cancer_type must be either 'colorectal'/'colorec' or 'pancreatic'/'panc'")
+            raise ValueError("cancer_type must be either 'colorec'/'colorec' or 'panc'/'panc'")
         
         # Validate data type and set appropriate defaults
         if data_type == 'methylation':
@@ -747,7 +747,7 @@ class OmicsAnalyzer(DataExtractor):
         Create violin plots showing distribution of omics features across cancer stages.
         
         Args:
-            cancer_type: "colorectal"/"colorec" or "pancreatic"/"panc"
+            cancer_type: "colorec"/"colorec" or "panc"/"panc"
             data_type: 'methylation', 'rnaseq', or 'scnv'
             n_genes: Number of top variable genes to display (default: 5)
             figsize: Figure size tuple (default: (20, 12))
@@ -755,14 +755,14 @@ class OmicsAnalyzer(DataExtractor):
             select_by: Method to select top genes ('overall_variance' or 'stage_variance')
         """
         # Data loading and validation
-        if cancer_type in ["colorectal", "colorec"]:
+        if cancer_type in ["colorec", "colorec"]:
             data = self.harmonized_colorec[data_type]
             clinical = self.harmonized_colorec["clinical"]
-            title_prefix = "Colorectal"
-        elif cancer_type in ["pancreatic", "panc"]:
+            title_prefix = "colorec"
+        elif cancer_type in ["panc", "panc"]:
             data = self.harmonized_panc[data_type]
             clinical = self.harmonized_panc["clinical"]
-            title_prefix = "Pancreatic"
+            title_prefix = "panc"
         else:
             raise ValueError("Invalid cancer_type")
 
@@ -927,7 +927,7 @@ class OmicsAnalyzer(DataExtractor):
         Create scatter/bubble plots showing the relationship between gene omics values and survival time.
         
         Args:
-            cancer_type: "colorectal"/"colorec" or "pancreatic"/"panc"
+            cancer_type: "colorec"/"colorec" or "panc"/"panc"
             data_type: Type of omics data ('methylation', 'rnaseq', or 'scnv')
             genes: List of specific genes to plot. If None, top variable genes will be selected.
             n_top_genes: Number of top variable genes to display if genes=None (default: 5)
@@ -941,16 +941,16 @@ class OmicsAnalyzer(DataExtractor):
             Matplotlib figure with the generated plots
         """
         # Determine which dataset to use based on cancer type
-        if cancer_type in ["colorectal", "colorec"]:
+        if cancer_type in ["colorec", "colorec"]:
             omics_data = self.harmonized_colorec[data_type]
             clinical = self.harmonized_colorec["clinical"]
-            title_prefix = "Colorectal"
-        elif cancer_type in ["pancreatic", "panc"]:
+            title_prefix = "colorec"
+        elif cancer_type in ["panc", "panc"]:
             omics_data = self.harmonized_panc[data_type]
             clinical = self.harmonized_panc["clinical"] 
-            title_prefix = "Pancreatic"
+            title_prefix = "panc"
         else:
-            raise ValueError("cancer_type must be either 'colorectal'/'colorec' or 'pancreatic'/'panc'")
+            raise ValueError("cancer_type must be either 'colorec'/'colorec' or 'panc'/'panc'")
             
         # Check if necessary survival columns exist in clinical data
         required_fields = ['status', 'overall_survival']
@@ -1179,7 +1179,7 @@ class OmicsAnalyzer(DataExtractor):
         Create Kaplan-Meier survival curves stratified by gene values (expression, methylation, or CNV).
         
         Args:
-            cancer_type: "colorectal"/"colorec" or "pancreatic"/"panc"
+            cancer_type: "colorec"/"colorec" or "panc"/"panc"
             data_type: Type of omics data ('methylation', 'rnaseq', or 'scnv')
             genes: List of specific genes to plot. If None, top variable genes will be selected.
             n_top_genes: Number of top variable genes to display if genes=None (default: 5)
@@ -1202,16 +1202,16 @@ class OmicsAnalyzer(DataExtractor):
             raise ImportError("This function requires the lifelines package. Please install it using 'pip install lifelines'.")
         
         # Determine which dataset to use based on cancer type
-        if cancer_type in ["colorectal", "colorec"]:
+        if cancer_type in ["colorec", "colorec"]:
             omics_data = self.harmonized_colorec[data_type]
             clinical = self.harmonized_colorec["clinical"]
-            title_prefix = "Colorectal"
-        elif cancer_type in ["pancreatic", "panc"]:
+            title_prefix = "colorec"
+        elif cancer_type in ["panc", "panc"]:
             omics_data = self.harmonized_panc[data_type]
             clinical = self.harmonized_panc["clinical"] 
-            title_prefix = "Pancreatic"
+            title_prefix = "panc"
         else:
-            raise ValueError("cancer_type must be either 'colorectal'/'colorec' or 'pancreatic'/'panc'")
+            raise ValueError("cancer_type must be either 'colorec'/'colorec' or 'panc'/'panc'")
             
         # Check if necessary survival columns exist in clinical data
         required_fields = ['status', 'overall_survival']

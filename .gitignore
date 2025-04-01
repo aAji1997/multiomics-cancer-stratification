@@ -1,3 +1,6 @@
+# Ignore very large files (>2GB)
+data/prepared_data_both.joblib
+
 # Python
 __pycache__/
 *.py[cod]
@@ -16,6 +19,7 @@ lib64/
 parts/
 sdist/
 var/
+wheels/
 *.egg-info/
 .installed.cfg
 *.egg
