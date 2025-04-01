@@ -2,15 +2,15 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter # Import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter 
 import argparse
 import os
 import numpy as np
 import time # Import time
-from datetime import datetime # For log directory timestamp
+from datetime import datetime
 
 # Local imports
-from model import JointAutoencoder # Import the new joint model
+from model import JointAutoencoder 
 from data_utils import load_prepared_data, JointOmicsDataset, prepare_graph_data
 
 def train_joint_autoencoder(args):
@@ -83,11 +83,6 @@ def train_joint_autoencoder(args):
     print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total Trainable Parameters: {total_params:,}")
-
-    # Optionally log graph to TensorBoard (can be slow/large)
-    # if args.log_graph:
-    #     dummy_omics_input = torch.randn(1, num_genes, num_modalities).to(device)
-    #     writer.add_graph(model, (graph_node_features, graph_edge_index, dummy_omics_input))
 
     # --- Loss and Optimizer ---
     # Omics Reconstruction Loss 
