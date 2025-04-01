@@ -12,3 +12,4 @@ data/panc/ filter=lfs diff=lfs merge=lfs -text
 data/colorec/*/* filter=lfs diff=lfs merge=lfs -text
 data/panc/*/* filter=lfs diff=lfs merge=lfs -text
 data/**/*.csv filter=lfs diff=lfs merge=lfs -text
+data/**/* filter=lfs diff=lfs merge=lfs -text
