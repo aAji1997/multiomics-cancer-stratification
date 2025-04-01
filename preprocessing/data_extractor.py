@@ -1289,12 +1289,12 @@ class DataExtractor:
             print(f"Data preparation complete for {cancer} cancer")
 
             #save results as joblib file
-            joblib.dump(results, f"data/prepared_data_{cancer_type}.joblib")
+            joblib.dump(results, f"../data/prepared_data_{cancer_type}.joblib")
             
         return results
 
 if __name__ == "__main__":
-        extractor = DataExtractor("./data")
+        extractor = DataExtractor("../data")
         print("----Preprocessing for autoencoders----")
         extractor.prepare_for_autoencoders()
 
