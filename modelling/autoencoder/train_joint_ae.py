@@ -8,6 +8,7 @@ import os
 import numpy as np
 import time # Import time
 from datetime import datetime
+from tqdm.auto import tqdm  # Add tqdm import
 
 # Local imports
 from model import JointAutoencoder 
@@ -97,13 +98,22 @@ def train_joint_autoencoder(args):
     global_step = 0
     start_time_total = time.time()
     model.train()
-    for epoch in range(args.epochs):
+    
+    # Create epoch progress bar
+    epoch_pbar = tqdm(range(args.epochs), desc='Training Epochs', position=0)
+    
+    for epoch in epoch_pbar:
         epoch_start_time = time.time()
         total_loss = 0.0
         total_omics_loss = 0.0
         total_graph_loss = 0.0
 
-        for batch_idx, omics_batch_structured in enumerate(dataloader):
+        # Create batch progress bar
+        batch_pbar = tqdm(enumerate(dataloader), total=len(dataloader), 
+                         desc=f'Epoch {epoch+1}/{args.epochs}', 
+                         leave=False, position=1)
+
+        for batch_idx, omics_batch_structured in batch_pbar:
             omics_batch_structured = omics_batch_structured.to(device)
             omics_reconstructed, adj_reconstructed, z_patient, z_gene = model(
                 graph_node_features, graph_edge_index, omics_batch_structured
@@ -116,6 +126,9 @@ def train_joint_autoencoder(args):
             optimizer.zero_grad()
             combined_loss.backward()
             optimizer.step()
+
+            # Update batch progress bar with current loss
+            batch_pbar.set_postfix({'loss': f'{combined_loss.item():.4f}'})
 
             # Log batch losses to TensorBoard
             writer.add_scalar('Loss/Batch/Total', combined_loss.item(), global_step)
@@ -133,6 +146,13 @@ def train_joint_autoencoder(args):
         avg_graph_loss = total_graph_loss / len(dataloader)
         epoch_duration = time.time() - epoch_start_time
 
+        # Update epoch progress bar with average losses
+        epoch_pbar.set_postfix({
+            'avg_loss': f'{avg_loss:.4f}',
+            'omics_loss': f'{avg_omics_loss:.4f}',
+            'graph_loss': f'{avg_graph_loss:.4f}'
+        })
+
         # Log epoch losses to TensorBoard
         writer.add_scalar('Loss/Epoch/Total', avg_loss, epoch)
         writer.add_scalar('Loss/Epoch/Omics', avg_omics_loss, epoch)
@@ -141,12 +161,12 @@ def train_joint_autoencoder(args):
         writer.add_scalar('Training/Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
 
         if (epoch + 1) % args.log_interval == 0:
-            print(f"Epoch [{epoch+1}/{args.epochs}], Avg Total Loss: {avg_loss:.6f}, "
+            print(f"\nEpoch [{epoch+1}/{args.epochs}], Avg Total Loss: {avg_loss:.6f}, "
                   f"Avg Omics Loss: {avg_omics_loss:.6f}, Avg Graph Loss: {avg_graph_loss:.6f}, "
                   f"Duration: {epoch_duration:.2f} sec")
 
     total_training_time = time.time() - start_time_total
-    print(f"Training finished. Total duration: {total_training_time:.2f} sec")
+    print(f"\nTraining finished. Total duration: {total_training_time:.2f} sec")
     writer.add_scalar('Timing/Total_Training_Duration_sec', total_training_time)
 
     # Close TensorBoard writer
