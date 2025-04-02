@@ -254,7 +254,7 @@ if __name__ == "__main__":
                         help='Weight for the graph reconstruction loss')
     parser.add_argument('--log_interval', type=int, default=5,
                         help='Log training status every n epochs')
-    parser.add_argument('--num_workers', type=int, default=0,
+    parser.add_argument('--num_workers', type=int, default=6,
                         help='Number of workers for DataLoader')
 
     args = parser.parse_args()
