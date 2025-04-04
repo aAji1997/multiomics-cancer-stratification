@@ -134,9 +134,23 @@ def train_joint_autoencoder(args):
         writer.add_scalar('Graph/Pruned_Edges', pruned_edges, 0)
         writer.add_scalar('Graph/Edge_Retention_Ratio', pruned_edges/orig_edges, 0)
 
+    # --- Prepare Data for Model ---
+    print("Converting adjacency matrix to binary for BCE target...")
+    # Ensure the target for BCE loss is binary (0 or 1), handles sparse/dense
+    if sp.issparse(adj_matrix):
+        adj_matrix_binary_target = adj_matrix.astype(bool).astype(float) 
+    else: # Handle numpy array case
+        adj_matrix_binary_target = (adj_matrix > 0).astype(float)
+    
     print("Preparing graph data...")
     # Use identity matrix as initial features for the graph AE part
-    graph_node_features, graph_edge_index, graph_adj_tensor = prepare_graph_data(adj_matrix, use_identity_features=True)
+    # Use the potentially *weighted* adj_matrix for input features/structure if needed,
+    # but the binarized one for the BCE target tensor.
+    # Assuming prepare_graph_data uses the matrix structure primarily for edge_index 
+    # and the tensor version for the BCE target. Let's pass the binarized one for safety.
+    graph_node_features, graph_edge_index, graph_adj_tensor = prepare_graph_data(
+        adj_matrix_binary_target, use_identity_features=True
+    )
     graph_feature_dim = graph_node_features.shape[1]
 
     # Move static graph data to device
