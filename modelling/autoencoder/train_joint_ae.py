@@ -9,10 +9,76 @@ import numpy as np
 import time # Import time
 from datetime import datetime
 from tqdm.auto import tqdm  # Add tqdm import
+import scipy.sparse as sp
 
 # Local imports
 from model import JointAutoencoder 
 from data_utils import load_prepared_data, JointOmicsDataset, prepare_graph_data
+
+def prune_graph(adj_matrix, threshold=0.5, keep_top_percent=None, min_edges_per_node=2):
+    """
+    Prunes the graph by either applying a threshold or keeping only a percentage of strongest edges.
+    
+    Args:
+        adj_matrix: scipy sparse or numpy adjacency matrix
+        threshold: Edge weight threshold, edges below this are pruned
+        keep_top_percent: If provided, keep this percentage of strongest edges
+        min_edges_per_node: Ensure each node has at least this many edges
+        
+    Returns:
+        Pruned adjacency matrix (same format as input)
+    """
+    print(f"Pruning graph with initial edges: {np.sum(adj_matrix > 0)}")
+    
+    # Convert to scipy sparse if not already
+    if not sp.issparse(adj_matrix):
+        adj_matrix = sp.csr_matrix(adj_matrix)
+    
+    if keep_top_percent is not None:
+        # Keep top X% of edges based on weight
+        flattened = adj_matrix.data.copy()
+        if len(flattened) > 0:  # Only if there are non-zero elements
+            cutoff_idx = max(1, int((1 - keep_top_percent) * len(flattened)))
+            cutoff_value = np.sort(flattened)[cutoff_idx]
+            pruned_adj = adj_matrix.copy()
+            pruned_adj.data[pruned_adj.data < cutoff_value] = 0
+            pruned_adj.eliminate_zeros()
+        else:
+            pruned_adj = adj_matrix.copy()
+    else:
+        # Apply threshold
+        pruned_adj = adj_matrix.copy()
+        pruned_adj.data[pruned_adj.data < threshold] = 0
+        pruned_adj.eliminate_zeros()
+    
+    # Ensure each node has at least min_edges_per_node connections
+    if min_edges_per_node > 0:
+        n_nodes = pruned_adj.shape[0]
+        for i in range(n_nodes):
+            row = pruned_adj.getrow(i)
+            if row.nnz < min_edges_per_node:
+                # If not enough edges, add back the strongest ones from original
+                if adj_matrix.getrow(i).nnz > 0:
+                    row_orig = adj_matrix.getrow(i)
+                    # Find missing edges to add
+                    n_to_add = min_edges_per_node - row.nnz
+                    if n_to_add > 0 and row_orig.nnz > row.nnz:
+                        indices = row_orig.indices[row_orig.data.argsort()[::-1]]
+                        # Add edges not already in pruned adj
+                        added = 0
+                        for idx in indices:
+                            if pruned_adj[i, idx] == 0 and i != idx:  # Skip self-loops
+                                pruned_adj[i, idx] = adj_matrix[i, idx]
+                                added += 1
+                                if added >= n_to_add:
+                                    break
+    
+    # Make symmetric if the original was symmetric
+    if (adj_matrix != adj_matrix.transpose()).nnz == 0:
+        pruned_adj = pruned_adj.maximum(pruned_adj.transpose())
+    
+    print(f"After pruning: {pruned_adj.nnz} edges remaining ({pruned_adj.nnz/adj_matrix.nnz:.2%} of original)")
+    return pruned_adj
 
 def train_joint_autoencoder(args):
     """Trains the Joint Autoencoder with TensorBoard logging."""
@@ -41,6 +107,32 @@ def train_joint_autoencoder(args):
     adj_matrix = cancer_data['adj_matrix']
     gene_list = cancer_data['gene_list']
     num_genes = len(gene_list)
+    
+    # Prune the graph if enabled
+    if args.prune_graph:
+        print(f"Pruning graph before training...")
+        orig_adj = adj_matrix.copy() if not sp.issparse(adj_matrix) else adj_matrix.copy()
+        adj_matrix = prune_graph(
+            adj_matrix, 
+            threshold=args.prune_threshold,
+            keep_top_percent=args.keep_top_percent,
+            min_edges_per_node=args.min_edges_per_node
+        )
+        
+        # Log graph statistics to TensorBoard
+        if sp.issparse(orig_adj):
+            orig_edges = orig_adj.nnz
+        else:
+            orig_edges = np.sum(orig_adj > 0)
+            
+        if sp.issparse(adj_matrix):
+            pruned_edges = adj_matrix.nnz
+        else:
+            pruned_edges = np.sum(adj_matrix > 0)
+            
+        writer.add_scalar('Graph/Original_Edges', orig_edges, 0)
+        writer.add_scalar('Graph/Pruned_Edges', pruned_edges, 0)
+        writer.add_scalar('Graph/Edge_Retention_Ratio', pruned_edges/orig_edges, 0)
 
     print("Preparing graph data...")
     # Use identity matrix as initial features for the graph AE part
@@ -238,6 +330,16 @@ if __name__ == "__main__":
                         help='Dimension of the latent patient embeddings (z_p)')
     parser.add_argument('--graph_dropout', type=float, default=0.5,
                         help='Dropout rate for GCN layers in graph AE')
+
+    # Graph Pruning Parameters
+    parser.add_argument('--prune_graph', action='store_true',
+                       help='Whether to prune the graph before training')
+    parser.add_argument('--prune_threshold', type=float, default=0.5,
+                       help='Edge weight threshold for pruning (edges below this are removed)')
+    parser.add_argument('--keep_top_percent', type=float, default=0.1,
+                       help='Keep only this percentage of strongest edges (0.1 = top 10%)')
+    parser.add_argument('--min_edges_per_node', type=int, default=2,
+                       help='Ensure each node has at least this many edges after pruning')
 
     # Training Hyperparameters
     parser.add_argument('--learning_rate', type=float, default=0.001,
