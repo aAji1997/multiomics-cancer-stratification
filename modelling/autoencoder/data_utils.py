@@ -134,33 +134,86 @@ class JointOmicsDataset(Dataset):
         # Transpose to get shape (num_genes, num_modalities)
         return tensor_data.t()
 
-def prepare_graph_data(adj_matrix, use_identity_features=True):
-    """Prepares graph data for the InteractionGraphAutoencoder."""
+def prepare_graph_data(adj_matrix, 
+                       gene_list=None, 
+                       omics_data_dict=None, 
+                       node_init_modality='identity'):
+    """Prepares graph data for the InteractionGraphAutoencoder.
+
+    Args:
+        adj_matrix (sparse or dense matrix): The adjacency matrix.
+        gene_list (list, optional): Ordered list of gene names corresponding to nodes.
+                                  Required if node_init_modality is not 'identity'.
+        omics_data_dict (dict, optional): Dictionary of omics DataFrames (patient x gene).
+                                      Required if node_init_modality is not 'identity'.
+        node_init_modality (str): Specifies how to initialize node features.
+                                 Options: 'identity', 'rnaseq', 'methylation', etc.
+                                 Defaults to 'identity'.
+
+    Returns:
+        tuple: Contains:
+            - node_features (Tensor): Initial node features (num_nodes, feature_dim).
+            - edge_index (LongTensor): Graph connectivity (2, num_edges).
+            - edge_weight (Tensor): Edge weights (num_edges,).
+            - adj_tensor (Tensor): Original adjacency matrix as a dense tensor.
+    """
     num_nodes = adj_matrix.shape[0]
 
     # Convert adjacency matrix to edge_index format for PyG
-    # Ensure input is a torch tensor
     if not isinstance(adj_matrix, torch.Tensor):
-        adj_tensor = torch.tensor(adj_matrix, dtype=torch.float32)
+        # If sparse, convert to dense first for dense_to_sparse
+        if hasattr(adj_matrix, "toarray"):
+            adj_matrix_dense = adj_matrix.toarray()
+        else:
+            adj_matrix_dense = np.asarray(adj_matrix) # Handle regular numpy array
+        adj_tensor = torch.tensor(adj_matrix_dense, dtype=torch.float32)
     else:
-        adj_tensor = adj_matrix.float()
+        adj_tensor = adj_matrix.float() # Assume it's already dense if tensor
+        if adj_tensor.is_sparse:
+            adj_tensor = adj_tensor.to_dense()
 
     edge_index, edge_weight = dense_to_sparse(adj_tensor)
-    # We might not need edge_weight if the GCN model doesn't use it explicitly,
-    # but dense_to_sparse returns it. We primarily need edge_index.
-    print(f"Converted adj matrix ({adj_tensor.shape}) to edge_index ({edge_index.shape})")
+    print(f"Converted adj matrix ({adj_tensor.shape}) to edge_index ({edge_index.shape}) and edge_weight ({edge_weight.shape})")
 
     # Prepare initial node features
-    if use_identity_features:
+    if node_init_modality == 'identity':
         node_features = torch.eye(num_nodes, dtype=torch.float32)
         print(f"Using identity matrix for node features. Shape: {node_features.shape}")
-    else:
-        # If you have other node features, prepare them here
-        # node_features = ... # Shape: (num_nodes, feature_dim)
-        raise NotImplementedError("Custom node features not implemented yet.")
-        # print(f"Using custom node features. Shape: {node_features.shape}")
+    elif omics_data_dict is not None and gene_list is not None:
+        if node_init_modality in omics_data_dict:
+            print(f"Using average '{node_init_modality}' for node features...")
+            omics_df = omics_data_dict[node_init_modality]
+            
+            # Ensure the dataframe is aligned with gene_list (should be done in dataset creation, but verify)
+            if not all(g in omics_df.columns for g in gene_list):
+                 raise ValueError(f"Omics data '{node_init_modality}' is missing genes from gene_list.")
+            if list(omics_df.columns) != gene_list:
+                 print(f"  Reordering omics columns to match gene_list for node features.")
+                 omics_df = omics_df[gene_list]
+            
+            # Calculate mean expression per gene across patients
+            # Ensure the index is patient_id if not already set (handle potential issues)
+            if 'patient_id' in omics_df.columns:
+                omics_df = omics_df.set_index('patient_id')
+            elif omics_df.index.name != 'patient_id':
+                 print(f"  Warning: Assuming index of '{node_init_modality}' is patient ID for averaging.")
 
-    return node_features, edge_index, adj_tensor
+            mean_features = omics_df.mean(axis=0).fillna(0).values # Calculate mean, fill NaNs with 0
+            
+            if len(mean_features) != num_nodes:
+                raise ValueError(f"Number of features ({len(mean_features)}) does not match number of nodes ({num_nodes}).")
+                
+            # Reshape to (num_nodes, 1)
+            node_features = torch.tensor(mean_features, dtype=torch.float32).unsqueeze(1)
+            print(f"Using average {node_init_modality} for node features. Shape: {node_features.shape}")
+        else:
+            raise ValueError(f"Modality '{node_init_modality}' not found in omics_data_dict.")
+    else:
+         # This case occurs if modality is not 'identity' but omics_data or gene_list is missing
+         raise ValueError("omics_data_dict and gene_list must be provided for non-identity node features.")
+
+    # Return edge_weight along with other components
+    return node_features, edge_index, edge_weight, adj_tensor
 
 if __name__ == '__main__':
     # Example usage: Load data for both cancer types
@@ -170,15 +223,34 @@ if __name__ == '__main__':
     if prepared_data and 'colorec' in prepared_data:
         print("\n--- Processing Colorectal Cancer Data for Joint Dataset---")
         colorec_data = prepared_data['colorec']
-
-        # 1. Prepare Graph Data (still needed for graph AE part)
+        omics_data_colorec = colorec_data['omics_data'] # Get omics data
         adj_matrix_colorec = colorec_data['adj_matrix']
         gene_list_colorec = colorec_data['gene_list']
-        graph_node_features, graph_edge_index, graph_adj_tensor = prepare_graph_data(adj_matrix_colorec)
 
-        # 2. Prepare Joint Omics Data
-        omics_data_colorec = colorec_data['omics_data']
-        modalities_to_use = ['rnaseq', 'methylation', 'scnv', 'miRNA'] # Define desired order
+        # Example 1: Identity features
+        print("\nTesting identity features:")
+        graph_node_features_id, graph_edge_index_id, graph_edge_weight_id, graph_adj_tensor_id = prepare_graph_data(
+            adj_matrix_colorec, 
+            node_init_modality='identity' # Explicitly request identity
+        )
+        print(f"Identity node features shape: {graph_node_features_id.shape}")
+        
+        # Example 2: RNA-seq features
+        print("\nTesting rnaseq features:")
+        if 'rnaseq' in omics_data_colorec:
+            graph_node_features_rna, graph_edge_index_rna, graph_edge_weight_rna, graph_adj_tensor_rna = prepare_graph_data(
+                adj_matrix_colorec, 
+                gene_list=gene_list_colorec, # Pass gene list
+                omics_data_dict=omics_data_colorec, # Pass omics data
+                node_init_modality='rnaseq' # Request rnaseq
+            )
+            print(f"RNA-seq node features shape: {graph_node_features_rna.shape}")
+            # print(f"Sample RNA-seq features:\n{graph_node_features_rna[:5]}") # Optional: print sample
+        else:
+             print("Skipping RNA-seq feature test: 'rnaseq' data not found.")
+
+        # Prepare Joint Omics Data (no change here)
+        modalities_to_use = ['rnaseq', 'methylation', 'scnv', 'miRNA']
 
         try:
             joint_omics_dataset = JointOmicsDataset(omics_data_colorec, gene_list_colorec, modalities=modalities_to_use)

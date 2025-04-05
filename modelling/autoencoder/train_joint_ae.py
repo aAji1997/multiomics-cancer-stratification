@@ -1,6 +1,7 @@
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter 
 import argparse
@@ -10,6 +11,7 @@ import time # Import time
 from datetime import datetime
 from tqdm.auto import tqdm  # Add tqdm import
 import scipy.sparse as sp
+import joblib
 
 # Local imports
 from model import JointAutoencoder 
@@ -142,21 +144,49 @@ def train_joint_autoencoder(args):
     else: # Handle numpy array case
         adj_matrix_binary_target = (adj_matrix > 0).astype(float)
     
-    print("Preparing graph data...")
-    # Use identity matrix as initial features for the graph AE part
-    # Use the potentially *weighted* adj_matrix for input features/structure if needed,
-    # but the binarized one for the BCE target tensor.
-    # Assuming prepare_graph_data uses the matrix structure primarily for edge_index 
-    # and the tensor version for the BCE target. Let's pass the binarized one for safety.
-    graph_node_features, graph_edge_index, graph_adj_tensor = prepare_graph_data(
-        adj_matrix_binary_target, use_identity_features=True
-    )
+    print("Preparing graph data based on --node_init_modality...")
+    # Decide how to call prepare_graph_data based on the argument
+    if args.node_init_modality == 'identity':
+        graph_node_features, graph_edge_index, graph_edge_weight, graph_adj_tensor = prepare_graph_data(
+            adj_matrix_binary_target, 
+            node_init_modality='identity'
+        )
+    else:
+        # Pass necessary omics data and gene list for non-identity features
+        graph_node_features, graph_edge_index, graph_edge_weight, graph_adj_tensor = prepare_graph_data(
+            adj_matrix_binary_target, 
+            gene_list=gene_list,
+            omics_data_dict=omics_data_dict, # Pass the full dictionary
+            node_init_modality=args.node_init_modality
+        )
+        
+    # Get the actual feature dimension from the created features
     graph_feature_dim = graph_node_features.shape[1]
+    print(f"Graph node feature dimension set to: {graph_feature_dim}")
 
     # Move static graph data to device
     graph_node_features = graph_node_features.to(device)
     graph_edge_index = graph_edge_index.to(device)
+    graph_edge_weight = graph_edge_weight.to(device) # Move edge weights to device
     graph_adj_tensor = graph_adj_tensor.to(device) # Target for graph reconstruction loss
+
+    # --- Calculate BCE pos_weight for graph loss (Moved earlier) ---
+    num_nodes = graph_adj_tensor.shape[0]
+    num_possible_edges = num_nodes * num_nodes # Include self-loops for calculation simplicity
+    num_positives = torch.sum(graph_adj_tensor).item()
+    num_negatives = num_possible_edges - num_positives
+    
+    if num_positives == 0:
+        print("Warning: No positive edges found in the graph adjacency tensor. Setting pos_weight to 1.")
+        base_pos_weight = 1.0
+    else:
+        base_pos_weight = num_negatives / num_positives
+        
+    final_pos_weight = base_pos_weight * args.bce_pos_weight_factor
+    # BCELoss expects pos_weight on the same device as the input/target tensors
+    pos_weight_tensor = torch.tensor([final_pos_weight], device=device)
+    print(f"Calculated BCE pos_weight: {base_pos_weight:.4f} * factor {args.bce_pos_weight_factor} = {final_pos_weight:.4f}")
+    # ---------------------------------------------
 
     print("Creating JointOmicsDataset...")
     modalities_to_use = args.modalities.split(',') if args.modalities else ['rnaseq', 'methylation', 'scnv', 'miRNA']
@@ -193,11 +223,27 @@ def train_joint_autoencoder(args):
 
     # --- Loss and Optimizer ---
     # Omics Reconstruction Loss 
-    omics_loss_fn = F.mse_loss # nn.MSELoss()
-    # Graph Reconstruction Loss (BCE for adjacency matrix probabilities)
-    graph_loss_fn = F.binary_cross_entropy
+    omics_loss_fn = F.mse_loss # Using functional version
 
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    # Graph Reconstruction Loss (BCE for adjacency matrix probabilities)
+    # Use nn.BCELoss module which accepts pos_weight
+    # Correcting: Use nn.BCEWithLogitsLoss which accepts pos_weight
+    graph_loss_fn = nn.BCEWithLogitsLoss(reduction='mean', pos_weight=pos_weight_tensor)
+
+    # Separate learning rates if specified
+    graph_ae_params = model.graph_autoencoder.parameters()
+    omics_processor_params = model.omics_processor.parameters()
+    
+    graph_ae_lr = args.graph_ae_lr if args.graph_ae_lr is not None else args.learning_rate
+    omics_processor_lr = args.omics_processor_lr if args.omics_processor_lr is not None else args.learning_rate
+    
+    print(f"Using LR for Graph AE: {graph_ae_lr}")
+    print(f"Using LR for Omics Processor: {omics_processor_lr}")
+
+    optimizer = optim.Adam([
+        {'params': graph_ae_params, 'lr': graph_ae_lr},
+        {'params': omics_processor_params, 'lr': omics_processor_lr}
+    ], weight_decay=args.weight_decay) # General LR is now ignored here, set per group
 
     # --- Training Loop ---
     print("\nStarting joint training...")
@@ -213,6 +259,7 @@ def train_joint_autoencoder(args):
         total_loss = 0.0
         total_omics_loss = 0.0
         total_graph_loss = 0.0
+        total_kl_loss = 0.0
 
         # Create batch progress bar
         batch_pbar = tqdm(enumerate(dataloader), total=len(dataloader), 
@@ -221,55 +268,76 @@ def train_joint_autoencoder(args):
 
         for batch_idx, omics_batch_structured in batch_pbar:
             omics_batch_structured = omics_batch_structured.to(device)
-            omics_reconstructed, adj_reconstructed, z_patient, z_gene = model(
-                graph_node_features, graph_edge_index, omics_batch_structured
+            # Model forward pass now returns mu and log_var for graph embeddings
+            omics_reconstructed, adj_reconstructed, z_patient, z_gene, mu, log_var = model(
+                graph_node_features, graph_edge_index, omics_batch_structured,
+                graph_edge_weight=graph_edge_weight
             )
 
+            # Calculate reconstruction losses
             loss_o = omics_loss_fn(omics_reconstructed, omics_batch_structured)
+            # Apply positive weight to BCE loss for graph reconstruction
+            # Weight is now part of the graph_loss_fn instance
             loss_g = graph_loss_fn(adj_reconstructed, graph_adj_tensor)
-            combined_loss = args.omics_loss_weight * loss_o + args.graph_loss_weight * loss_g
+            
+            # Calculate KL divergence loss for the graph VGAE
+            # Normalize by number of nodes (genes)
+            loss_kl = -0.5 * torch.mean(torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1))
+            # Alternatively, normalize by num_nodes * batch_size if needed, but mean over nodes seems standard
+            # loss_kl = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp()) / model.num_nodes
+
+            # Combine losses
+            combined_loss = (args.omics_loss_weight * loss_o + 
+                             args.graph_loss_weight * loss_g + 
+                             args.kl_loss_weight * loss_kl)
 
             optimizer.zero_grad()
             combined_loss.backward()
             optimizer.step()
 
             # Update batch progress bar with current loss
-            batch_pbar.set_postfix({'loss': f'{combined_loss.item():.4f}'})
+            batch_pbar.set_postfix({'loss': f'{combined_loss.item():.4f}', 'kl_loss': f'{loss_kl.item():.4f}'})
 
             # Log batch losses to TensorBoard
             writer.add_scalar('Loss/Batch/Total', combined_loss.item(), global_step)
             writer.add_scalar('Loss/Batch/Omics', loss_o.item(), global_step)
             writer.add_scalar('Loss/Batch/Graph', loss_g.item(), global_step)
+            writer.add_scalar('Loss/Batch/KL', loss_kl.item(), global_step) # Log KL loss
 
             total_loss += combined_loss.item()
             total_omics_loss += loss_o.item()
             total_graph_loss += loss_g.item()
+            # We also need to track total KL loss for epoch average
+            total_kl_loss += loss_kl.item()
             global_step += 1
-
+            
         # Log epoch results
         avg_loss = total_loss / len(dataloader)
         avg_omics_loss = total_omics_loss / len(dataloader)
         avg_graph_loss = total_graph_loss / len(dataloader)
+        avg_kl_loss = total_kl_loss / len(dataloader) # Calculate average KL loss
         epoch_duration = time.time() - epoch_start_time
 
         # Update epoch progress bar with average losses
         epoch_pbar.set_postfix({
             'avg_loss': f'{avg_loss:.4f}',
             'omics_loss': f'{avg_omics_loss:.4f}',
-            'graph_loss': f'{avg_graph_loss:.4f}'
+            'graph_loss': f'{avg_graph_loss:.4f}',
+            'kl_loss': f'{avg_kl_loss:.4f}' # Add KL loss to progress bar
         })
 
         # Log epoch losses to TensorBoard
         writer.add_scalar('Loss/Epoch/Total', avg_loss, epoch)
         writer.add_scalar('Loss/Epoch/Omics', avg_omics_loss, epoch)
         writer.add_scalar('Loss/Epoch/Graph', avg_graph_loss, epoch)
+        writer.add_scalar('Loss/Epoch/KL', avg_kl_loss, epoch) # Log average epoch KL loss
         writer.add_scalar('Timing/Epoch_Duration_sec', epoch_duration, epoch)
         writer.add_scalar('Training/Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
 
         if (epoch + 1) % args.log_interval == 0:
             print(f"\nEpoch [{epoch+1}/{args.epochs}], Avg Total Loss: {avg_loss:.6f}, "
                   f"Avg Omics Loss: {avg_omics_loss:.6f}, Avg Graph Loss: {avg_graph_loss:.6f}, "
-                  f"Duration: {epoch_duration:.2f} sec")
+                  f"Avg KL Loss: {avg_kl_loss:.6f}, Duration: {epoch_duration:.2f} sec") # Add KL loss to printout
 
     total_training_time = time.time() - start_time_total
     print(f"\nTraining finished. Total duration: {total_training_time:.2f} sec")
@@ -293,34 +361,41 @@ def train_joint_autoencoder(args):
         all_patient_embeddings = []
         final_gene_embeddings = None
         with torch.no_grad():
-            # Get final gene embeddings (only needs to be done once)
-            final_gene_embeddings = model.graph_autoencoder.encode(graph_node_features, graph_edge_index).cpu().numpy()
+            # Get final gene embeddings (use the mean `mu` from VGAE)
+            # Pass edge_weight here as well
+            # encode now returns mu, log_var, z_gene. We want mu for inference.
+            mu_final, _, _ = model.graph_autoencoder.encode(
+                graph_node_features, graph_edge_index, edge_weight=graph_edge_weight
+            )
+            final_gene_embeddings = mu_final.cpu().numpy()
 
             # Get patient embeddings (process data in batches)
             inference_dataloader = DataLoader(joint_omics_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
             for omics_batch_structured in inference_dataloader:
                 omics_batch_structured = omics_batch_structured.to(device)
-                # Need z_gene on the correct device for the encode step
-                z_gene_device = model.graph_autoencoder.encode(graph_node_features, graph_edge_index)
-                patient_embeddings = model.omics_processor.encode(omics_batch_structured, z_gene_device)
+                # Need z_gene (actually mu during inference) on the correct device for the encode step
+                # Recalculate mu_device for consistency during inference
+                mu_device, _, z_gene_eval = model.graph_autoencoder.encode( # Use z_gene_eval which is mu when model.eval()
+                    graph_node_features, graph_edge_index, edge_weight=graph_edge_weight
+                )
+                # Pass the deterministic embedding (mu) to the omics encoder during inference
+                patient_embeddings = model.omics_processor.encode(omics_batch_structured, z_gene_eval)
                 all_patient_embeddings.append(patient_embeddings.cpu().numpy())
 
         final_patient_embeddings = np.concatenate(all_patient_embeddings, axis=0)
 
-        # Save gene embeddings
-        gene_emb_save_path = os.path.join(args.output_dir, f'joint_ae_gene_embeddings_{args.cancer_type}.npy')
-        np.save(gene_emb_save_path, final_gene_embeddings)
-        print(f"Gene embeddings (Z_gene) saved to {gene_emb_save_path}")
-
-        # Save patient embeddings
-        patient_emb_save_path = os.path.join(args.output_dir, f'joint_ae_patient_embeddings_{args.cancer_type}.npy')
-        np.save(patient_emb_save_path, final_patient_embeddings)
-        print(f"Patient embeddings (z_p) saved to {patient_emb_save_path}")
-
-        # Save corresponding patient IDs
-        patient_ids_path = os.path.join(args.output_dir, f'joint_ae_patient_ids_{args.cancer_type}.npy')
-        np.save(patient_ids_path, np.array(joint_omics_dataset.patient_ids))
-        print(f"Patient IDs saved to {patient_ids_path}")
+        # Create a dictionary with all embeddings and IDs
+        embeddings_dict = {
+            'gene_embeddings': final_gene_embeddings,
+            'patient_embeddings': final_patient_embeddings,
+            'patient_ids': np.array(joint_omics_dataset.patient_ids),
+            'gene_list': gene_list
+        }
+        
+        # Save the dictionary as a single joblib file
+        embeddings_save_path = os.path.join(args.output_dir, f'joint_ae_embeddings_{args.cancer_type}.joblib')
+        joblib.dump(embeddings_dict, embeddings_save_path)
+        print(f"All embeddings and IDs saved to {embeddings_save_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train Joint Graph-Omics Autoencoder')
@@ -344,6 +419,8 @@ if __name__ == "__main__":
                         help='Dimension of the latent patient embeddings (z_p)')
     parser.add_argument('--graph_dropout', type=float, default=0.5,
                         help='Dropout rate for GCN layers in graph AE')
+    parser.add_argument('--node_init_modality', type=str, default='identity',
+                       help='Method for initializing graph node features. Options: identity, or an omics type like rnaseq or methylation.')
 
     # Graph Pruning Parameters
     parser.add_argument('--prune_graph', action='store_true',
@@ -357,7 +434,11 @@ if __name__ == "__main__":
 
     # Training Hyperparameters
     parser.add_argument('--learning_rate', type=float, default=0.001,
-                        help='Learning rate for the optimizer')
+                        help='Default learning rate for the optimizer (used if component-specific LRs are not set)')
+    parser.add_argument('--graph_ae_lr', type=float, default=None,
+                        help='Specific learning rate for the graph autoencoder (defaults to --learning_rate)')
+    parser.add_argument('--omics_processor_lr', type=float, default=None,
+                        help='Specific learning rate for the omics processor (defaults to --learning_rate)')
     parser.add_argument('--weight_decay', type=float, default=1e-5,
                         help='Weight decay (L2 penalty)')
     parser.add_argument('--epochs', type=int, default=150,
@@ -368,6 +449,10 @@ if __name__ == "__main__":
                         help='Weight for the omics reconstruction loss')
     parser.add_argument('--graph_loss_weight', type=float, default=0.5,
                         help='Weight for the graph reconstruction loss')
+    parser.add_argument('--kl_loss_weight', type=float, default=0.01,
+                       help='Weight for the KL divergence loss in VGAE')
+    parser.add_argument('--bce_pos_weight_factor', type=float, default=1.0,
+                       help='Factor to multiply the calculated BCE pos_weight for graph edges.')
     parser.add_argument('--log_interval', type=int, default=5,
                         help='Log training status every n epochs')
     parser.add_argument('--num_workers', type=int, default=6,

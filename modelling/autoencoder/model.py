@@ -7,45 +7,74 @@ import pandas as pd
 import torch_geometric as tg
 
 # Graph Autoencoder (responsible for gene embeddings Z_gene)
-# Remains largely the same, but ensure hidden_dim matches the desired gene_embedding_dim
+# Modified to be a Variational Graph Autoencoder (VGAE)
 class InteractionGraphAutoencoder(nn.Module):
     def __init__(self, feature_dim, gene_embedding_dim, dropout=0.5):
         """
         Args:
-            feature_dim (int): Dimension of initial node features (e.g., num_genes for identity).
+            feature_dim (int): Dimension of initial node features.
             gene_embedding_dim (int): Dimension of the latent gene embeddings (Z_gene).
             dropout (float): Dropout probability.
         """
         super(InteractionGraphAutoencoder, self).__init__()
-        # Using two GCN layers. Adjust complexity if needed.
-        # Intermediate dimension can be tuned.
         hidden_channels_intermediate = gene_embedding_dim * 2
         self.conv1 = tg.nn.GCNConv(feature_dim, hidden_channels_intermediate)
-        # Output dimension is the final gene embedding size
-        self.conv2 = tg.nn.GCNConv(hidden_channels_intermediate, gene_embedding_dim)
-        self.dropout = nn.Dropout(dropout)
+        self.norm1 = nn.LayerNorm(hidden_channels_intermediate)
+        
+        # Output layers for mean (mu) and log variance (log_var)
+        # GCNConv outputting 2*embedding_dim, split later
+        self.conv_out = tg.nn.GCNConv(hidden_channels_intermediate, gene_embedding_dim * 2)
+        
+        self.dropout_layer = nn.Dropout(dropout) # Renamed from self.dropout to avoid conflict
 
-    def encode(self, x, edge_index):
-        """Encodes the graph into latent gene embeddings (Z_gene)."""
-        x = self.conv1(x, edge_index)
+    def encode(self, x, edge_index, edge_weight=None):
+        """Encodes the graph into latent distribution parameters (mu, log_var) 
+           and samples gene embeddings (z_gene).
+
+        Args:
+            x (Tensor): Node features.
+            edge_index (LongTensor): Graph connectivity.
+            edge_weight (Tensor, optional): Edge weights. Defaults to None.
+            
+        Returns:
+            tuple: Contains mu (mean), log_var (log variance), and z_gene (sampled embedding).
+        """
+        x = self.conv1(x, edge_index, edge_weight=edge_weight)
         x = F.relu(x)
-        x = self.dropout(x)
-        # No activation on the final embedding layer generally
-        z_gene = self.conv2(x, edge_index)
-        return z_gene
+        x = self.norm1(x)
+        x = self.dropout_layer(x)
+        
+        # Get the combined output for mu and log_var
+        out_features = self.conv_out(x, edge_index, edge_weight=edge_weight)
+        
+        # Split into mu and log_var
+        mu = out_features[:, :out_features.shape[1] // 2]
+        log_var = out_features[:, out_features.shape[1] // 2:]
+        
+        z_gene = self.reparameterize(mu, log_var)
+        return mu, log_var, z_gene
+
+    def reparameterize(self, mu, log_var):
+        """Performs reparameterization trick to sample from Gaussian distribution."""
+        if self.training:
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            return eps * std + mu
+        else:
+            # During evaluation, use the mean directly
+            return mu
 
     def decode(self, z_gene):
-        """Reconstructs the adjacency matrix from latent gene embeddings."""
-        adj_rec = torch.sigmoid(z_gene @ z_gene.t())
-        return adj_rec
+        """Reconstructs the adjacency matrix logits from latent gene embeddings."""
+        # Remove sigmoid: BCEWithLogitsLoss expects raw logits
+        adj_rec_logits = z_gene @ z_gene.t()
+        return adj_rec_logits
 
-    def forward(self, x, edge_index):
-        """Full forward pass for standalone graph AE (if needed) or just encoding"""
-        z_gene = self.encode(x, edge_index)
-        # Decoding might happen separately in the joint model using z_gene
-        # adj_reconstructed = self.decode(z_gene)
-        # return adj_reconstructed, z_gene
-        return z_gene # Primarily used for encoding in the joint model
+    # Standalone forward might not be needed if only using encode/decode in JointAE
+    def forward(self, x, edge_index, edge_weight=None):
+        mu, log_var, z_gene = self.encode(x, edge_index, edge_weight)
+        adj_reconstructed = self.decode(z_gene)
+        return adj_reconstructed, mu, log_var, z_gene
 
 
 # Modified Omics Processor (integrates Z_gene, encodes/decodes patient omics)
@@ -154,7 +183,8 @@ class OmicsProcessor(nn.Module):
         reconstructed_structured = reconstructed_flat.view(batch_size, self.num_genes, self.num_modalities)
         return reconstructed_structured
 
-# Joint Autoencoder Wrapper
+
+# Joint Autoencoder Wrapper (Now incorporating VGAE for graph part)
 class JointAutoencoder(nn.Module):
     def __init__(self, num_nodes, num_modalities, graph_feature_dim,
                  gene_embedding_dim, patient_embedding_dim, graph_dropout=0.5):
@@ -168,6 +198,7 @@ class JointAutoencoder(nn.Module):
             graph_dropout (float): Dropout for the graph AE.
         """
         super(JointAutoencoder, self).__init__()
+        self.num_nodes = num_nodes # Store num_nodes for KL loss calculation later
         self.graph_autoencoder = InteractionGraphAutoencoder(
             feature_dim=graph_feature_dim,
             gene_embedding_dim=gene_embedding_dim,
@@ -180,37 +211,38 @@ class JointAutoencoder(nn.Module):
             num_genes=num_nodes
         )
 
-    def forward(self, graph_x, graph_edge_index, omics_x_structured):
+    def forward(self, graph_x, graph_edge_index, omics_x_structured, graph_edge_weight=None):
         """
-        Performs the full joint forward pass.
+        Performs the full joint forward pass with VGAE.
 
         Args:
-            graph_x (Tensor): Initial node features for the graph AE (e.g., identity matrix) (num_nodes, graph_feature_dim).
-            graph_edge_index (LongTensor): Graph connectivity (2, num_edges).
-            omics_x_structured (Tensor): Batch of patient omics data (batch_size, num_nodes, num_modalities).
+            graph_x (Tensor): Initial node features for the graph AE.
+            graph_edge_index (LongTensor): Graph connectivity.
+            omics_x_structured (Tensor): Batch of patient omics data.
+            graph_edge_weight (Tensor, optional): Edge weights for the graph AE.
 
         Returns:
             tuple: Contains:
-                - omics_reconstructed (Tensor): Reconstructed omics data (batch_size, num_nodes, num_modalities).
-                - adj_reconstructed (Tensor): Reconstructed adjacency matrix (num_nodes, num_nodes).
-                - z_patient (Tensor): Patient latent embeddings (batch_size, patient_embedding_dim).
-                - z_gene (Tensor): Gene latent embeddings (num_nodes, gene_embedding_dim).
+                - omics_reconstructed (Tensor)
+                - adj_reconstructed (Tensor)
+                - z_patient (Tensor)
+                - z_gene (Tensor): Sampled gene embeddings.
+                - mu (Tensor): Mean of the gene embedding distribution.
+                - log_var (Tensor): Log variance of the gene embedding distribution.
         """
-        # 1. Get gene embeddings from graph AE
-        z_gene = self.graph_autoencoder.encode(graph_x, graph_edge_index) # (N, gene_emb_dim)
+        # 1. Get gene embeddings (mu, log_var, sampled z_gene) from graph VGAE
+        mu, log_var, z_gene = self.graph_autoencoder.encode(graph_x, graph_edge_index, edge_weight=graph_edge_weight)
 
-        # 2. Encode patient omics using OmicsProcessor and z_gene
-        z_patient = self.omics_processor.encode(omics_x_structured, z_gene) # (B, patient_emb_dim)
+        # 2. Encode patient omics using OmicsProcessor and the *sampled* z_gene
+        z_patient = self.omics_processor.encode(omics_x_structured, z_gene)
 
         # 3. Decode patient embedding back to omics
-        omics_reconstructed = self.omics_processor.decode(z_patient) # (B, N, M)
+        omics_reconstructed = self.omics_processor.decode(z_patient)
 
-        # 4. Decode gene embeddings back to adjacency matrix
-        adj_reconstructed = self.graph_autoencoder.decode(z_gene) # (N, N)
+        # 4. Decode *sampled* gene embeddings back to adjacency matrix
+        adj_reconstructed = self.graph_autoencoder.decode(z_gene)
 
-        return omics_reconstructed, adj_reconstructed, z_patient, z_gene
+        return omics_reconstructed, adj_reconstructed, z_patient, z_gene, mu, log_var
 
-# Remove the old OmicsAutoencoder class
-# class OmicsAutoencoder(nn.Module):
-#    ... (definition removed) ...
+
 
