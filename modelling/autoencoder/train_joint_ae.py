@@ -407,7 +407,7 @@ if __name__ == "__main__":
                         help='Cancer type to train on')
     parser.add_argument('--modalities', type=str, default='rnaseq,methylation,scnv,miRNA',
                         help='Comma-separated list of omics modalities to use')
-    parser.add_argument('--output_dir', type=str, default='../trained_models',
+    parser.add_argument('--output_dir', type=str, default='./trained_models',
                         help='Directory to save trained models and embeddings')
     parser.add_argument('--log_dir', type=str, default='./logs', 
                         help='Directory to save TensorBoard logs')
