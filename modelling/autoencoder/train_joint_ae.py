@@ -3,7 +3,6 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter 
 import argparse
 import os
 import numpy as np
@@ -12,10 +11,23 @@ from datetime import datetime
 from tqdm.auto import tqdm  # Add tqdm import
 import scipy.sparse as sp
 import joblib
+import json # Import json for parsing argument
 
 # Local imports
 from model import JointAutoencoder 
 from data_utils import load_prepared_data, JointOmicsDataset, prepare_graph_data
+
+# weights and biases
+import wandb
+import weave
+
+# load api key from file
+with open('.api_config.json', 'r') as f:
+    config = json.load(f)
+    WANDB_API_KEY = config['wandb_api_key']
+
+# add to environment variables
+os.environ["WANDB_API_KEY"] = WANDB_API_KEY
 
 def prune_graph(adj_matrix, threshold=0.5, keep_top_percent=None, min_edges_per_node=2):
     """
@@ -82,26 +94,49 @@ def prune_graph(adj_matrix, threshold=0.5, keep_top_percent=None, min_edges_per_
     print(f"After pruning: {pruned_adj.nnz} edges remaining ({pruned_adj.nnz/adj_matrix.nnz:.2%} of original)")
     return pruned_adj
 
+@weave.op() # Decorate the main training function for Weave tracking
 def train_joint_autoencoder(args):
-    """Trains the Joint Autoencoder with TensorBoard logging."""
+    """Trains the Joint Autoencoder with WandB and Weave logging."""
 
     # Device configuration
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- TensorBoard Setup ---
-    # Create a unique log directory for this run
+    # --- Weights & Biases / Weave Setup ---
     run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_path = os.path.join(args.log_dir, f"{args.cancer_type}_{run_timestamp}")
-    writer = SummaryWriter(log_path)
-    print(f"TensorBoard logs will be saved to: {log_path}")
+    run_name = f"{args.cancer_type}_{run_timestamp}"
+    project_name = f"joint-ae-training-{args.cancer_type}" # Customize as needed
+
+    print("Initializing Weights & Biases and Weave...")
+    try:
+        # Login to wandb (use environment variable WANDB_API_KEY or run wandb login)
+        # wandb.login(key=WANDB_API_KEY) # Uncomment if key is not set as env var
+
+        # Initialize wandb run
+        wandb.init(
+            project=project_name,
+            name=run_name,
+            config=vars(args) # Log hyperparameters
+        )
+        
+        # Initialize Weave tracking, linked to the wandb project
+        # weave.init(project_name) # Weave seems to automatically use the wandb run context now
+        
+        print(f"W&B Run URL: {wandb.run.get_url()}")
+        
+    except Exception as e:
+        print(f"Error initializing W&B/Weave: {e}. Proceeding without W&B tracking.")
+        # Fallback to disabled mode if initialization fails
+        os.environ["WANDB_DISABLED"] = "true" 
+        wandb.init(mode="disabled") 
+        # Weave tracking will also likely not work if wandb init fails
+
 
     # --- Data Loading and Preparation ---
     print("Loading data...")
     prepared_data = load_prepared_data(args.data_path)
     if not prepared_data or args.cancer_type not in prepared_data:
         print(f"Error: Could not load or find data for {args.cancer_type} in {args.data_path}")
-        writer.close()
         return
 
     cancer_data = prepared_data[args.cancer_type]
@@ -110,7 +145,34 @@ def train_joint_autoencoder(args):
     gene_list = cancer_data['gene_list']
     num_genes = len(gene_list)
     
+    # ADDED: Make adjacency matrix symmetric (undirected) to match GCN assumptions
+    print("Making adjacency matrix symmetric (undirected)...")
+    if sp.issparse(adj_matrix):
+        orig_edges = adj_matrix.nnz
+        adj_matrix = adj_matrix.maximum(adj_matrix.transpose())
+        sym_edges = adj_matrix.nnz
+        print(f"Symmetrizing: {orig_edges} edges → {sym_edges} edges")
+    else:  # If it's a dense numpy array
+        orig_edges = np.sum(adj_matrix > 0)
+        adj_matrix = np.maximum(adj_matrix, adj_matrix.T)
+        sym_edges = np.sum(adj_matrix > 0)
+        print(f"Symmetrizing: {orig_edges} edges → {sym_edges} edges")
+    
+    # ADDED: Remove self-loops from adjacency matrix
+    print("Removing self-loops from adjacency matrix...")
+    if sp.issparse(adj_matrix):
+        num_self_loops = adj_matrix.diagonal().sum()
+        adj_matrix.setdiag(0)
+        adj_matrix.eliminate_zeros()  # Important for sparse matrices
+        print(f"Removed {int(num_self_loops)} self-loops")
+    else:
+        num_self_loops = np.sum(np.diag(adj_matrix) > 0)
+        np.fill_diagonal(adj_matrix, 0)
+        print(f"Removed {int(num_self_loops)} self-loops")
+    
     # Prune the graph if enabled
+    orig_edges = 0
+    pruned_edges = 0
     if args.prune_graph:
         print(f"Pruning graph before training...")
         orig_adj = adj_matrix.copy() if not sp.issparse(adj_matrix) else adj_matrix.copy()
@@ -121,7 +183,7 @@ def train_joint_autoencoder(args):
             min_edges_per_node=args.min_edges_per_node
         )
         
-        # Log graph statistics to TensorBoard
+        # Log graph statistics to WandB right after pruning
         if sp.issparse(orig_adj):
             orig_edges = orig_adj.nnz
         else:
@@ -132,9 +194,11 @@ def train_joint_autoencoder(args):
         else:
             pruned_edges = np.sum(adj_matrix > 0)
             
-        writer.add_scalar('Graph/Original_Edges', orig_edges, 0)
-        writer.add_scalar('Graph/Pruned_Edges', pruned_edges, 0)
-        writer.add_scalar('Graph/Edge_Retention_Ratio', pruned_edges/orig_edges, 0)
+        wandb.log({
+            'Graph/Original_Edges': orig_edges,
+            'Graph/Pruned_Edges': pruned_edges,
+            'Graph/Edge_Retention_Ratio': pruned_edges / orig_edges if orig_edges > 0 else 0
+        }, commit=False) # Commit later with other step 0 metrics or first batch log
 
     # --- Prepare Data for Model ---
     print("Converting adjacency matrix to binary for BCE target...")
@@ -194,12 +258,10 @@ def train_joint_autoencoder(args):
         joint_omics_dataset = JointOmicsDataset(omics_data_dict, gene_list, modalities=modalities_to_use)
     except (ValueError, KeyError) as e:
         print(f"Error creating JointOmicsDataset: {e}")
-        writer.close()
         return
 
     if len(joint_omics_dataset) == 0:
         print("Error: JointOmicsDataset is empty.")
-        writer.close()
         return
 
     num_modalities = joint_omics_dataset.num_modalities
@@ -207,9 +269,32 @@ def train_joint_autoencoder(args):
     print(f"Created DataLoader with {len(dataloader)} batches.")
 
     # --- Model Instantiation ---
+    # Parse modality latent dimensions from JSON file
+    try:
+        with open(args.modality_latents_path, 'r') as f:
+            modality_latent_dims = json.load(f)
+        # Basic validation: check if it's a dict and values are int
+        if not isinstance(modality_latent_dims, dict) or not all(isinstance(v, int) for v in modality_latent_dims.values()):
+            raise ValueError("JSON file must contain a dictionary mapping modality names to integer dimensions.")
+        # Check if keys match the requested modalities
+        if set(modality_latent_dims.keys()) != set(modalities_to_use):
+            raise ValueError(f"Keys in modality_latents file {list(modality_latent_dims.keys())} must match --modalities {modalities_to_use}")
+        print(f"Using modality latent dimensions: {modality_latent_dims}")
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f"Error parsing modality_latents JSON file: {e}")
+        return
+    except FileNotFoundError:
+        print(f"Error: Could not find the modality_latents JSON file at {args.modality_latents_path}")
+        return
+    
+    # Use modalities_to_use as the order, consistent with JointOmicsDataset
+    modality_order = modalities_to_use
+
     model = JointAutoencoder(
         num_nodes=num_genes,
-        num_modalities=num_modalities,
+        # Pass modality dims and order instead of num_modalities
+        modality_latent_dims=modality_latent_dims,
+        modality_order=modality_order,
         graph_feature_dim=graph_feature_dim,
         gene_embedding_dim=args.gene_embedding_dim,
         patient_embedding_dim=args.patient_embedding_dim,
@@ -220,14 +305,18 @@ def train_joint_autoencoder(args):
     print(model)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total Trainable Parameters: {total_params:,}")
+    wandb.summary['Model_Architecture_String'] = str(model) # Log model string representation
+    wandb.summary['Total_Trainable_Parameters'] = total_params # Log total params to summary
+
+    # --- Watch Model with WandB (Optional) ---
+    # Monitors gradients and parameters. Can be resource-intensive.
+    wandb.watch(model, log="gradients", log_freq=args.log_interval * len(dataloader), log_graph=True)
 
     # --- Loss and Optimizer ---
     # Omics Reconstruction Loss 
     omics_loss_fn = F.mse_loss # Using functional version
 
-    # Graph Reconstruction Loss (BCE for adjacency matrix probabilities)
-    # Use nn.BCELoss module which accepts pos_weight
-    # Correcting: Use nn.BCEWithLogitsLoss which accepts pos_weight
+    # Graph Reconstruction Loss 
     graph_loss_fn = nn.BCEWithLogitsLoss(reduction='mean', pos_weight=pos_weight_tensor)
 
     # Separate learning rates if specified
@@ -298,11 +387,13 @@ def train_joint_autoencoder(args):
             # Update batch progress bar with current loss
             batch_pbar.set_postfix({'loss': f'{combined_loss.item():.4f}', 'kl_loss': f'{loss_kl.item():.4f}'})
 
-            # Log batch losses to TensorBoard
-            writer.add_scalar('Loss/Batch/Total', combined_loss.item(), global_step)
-            writer.add_scalar('Loss/Batch/Omics', loss_o.item(), global_step)
-            writer.add_scalar('Loss/Batch/Graph', loss_g.item(), global_step)
-            writer.add_scalar('Loss/Batch/KL', loss_kl.item(), global_step) # Log KL loss
+            # Log batch losses to WandB
+            wandb.log({
+                'Loss/Batch/Total': combined_loss.item(),
+                'Loss/Batch/Omics': loss_o.item(),
+                'Loss/Batch/Graph': loss_g.item(),
+                'Loss/Batch/KL': loss_kl.item()
+            }, step=global_step) # Use global_step for x-axis
 
             total_loss += combined_loss.item()
             total_omics_loss += loss_o.item()
@@ -326,13 +417,18 @@ def train_joint_autoencoder(args):
             'kl_loss': f'{avg_kl_loss:.4f}' # Add KL loss to progress bar
         })
 
-        # Log epoch losses to TensorBoard
-        writer.add_scalar('Loss/Epoch/Total', avg_loss, epoch)
-        writer.add_scalar('Loss/Epoch/Omics', avg_omics_loss, epoch)
-        writer.add_scalar('Loss/Epoch/Graph', avg_graph_loss, epoch)
-        writer.add_scalar('Loss/Epoch/KL', avg_kl_loss, epoch) # Log average epoch KL loss
-        writer.add_scalar('Timing/Epoch_Duration_sec', epoch_duration, epoch)
-        writer.add_scalar('Training/Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+        # Log epoch losses to WandB (use epoch as step)
+        wandb.log({
+            'Loss/Epoch/Total': avg_loss,
+            'Loss/Epoch/Omics': avg_omics_loss,
+            'Loss/Epoch/Graph': avg_graph_loss,
+            'Loss/Epoch/KL': avg_kl_loss,
+            'Timing/Epoch_Duration_sec': epoch_duration,
+            'Training/Learning_Rate_GraphAE': optimizer.param_groups[0]['lr'],
+            'Training/Learning_Rate_OmicsProc': optimizer.param_groups[1]['lr'],
+            'epoch': epoch # Explicitly log epoch number for easier filtering/grouping in W&B UI
+        }) # W&B automatically uses its internal step counter if 'step' isn't provided, 
+           # but logging 'epoch' explicitly is good practice.
 
         if (epoch + 1) % args.log_interval == 0:
             print(f"\nEpoch [{epoch+1}/{args.epochs}], Avg Total Loss: {avg_loss:.6f}, "
@@ -341,12 +437,15 @@ def train_joint_autoencoder(args):
 
     total_training_time = time.time() - start_time_total
     print(f"\nTraining finished. Total duration: {total_training_time:.2f} sec")
-    writer.add_scalar('Timing/Total_Training_Duration_sec', total_training_time)
+    # Log total training time to WandB summary
+    wandb.summary['Timing/Total_Training_Duration_sec'] = total_training_time 
 
-    # Close TensorBoard writer
-    writer.close()
+    # Close TensorBoard writer # REMOVED
+    # writer.close() # REMOVED
 
-    # --- Saving --- #
+    # --- Saving & WandB Artifact Logging --- #
+    model_save_path = None
+    embeddings_save_path = None
     if args.output_dir:
         if not os.path.exists(args.output_dir):
             os.makedirs(args.output_dir)
@@ -397,6 +496,31 @@ def train_joint_autoencoder(args):
         joblib.dump(embeddings_dict, embeddings_save_path)
         print(f"All embeddings and IDs saved to {embeddings_save_path}")
 
+    # --- Finish Logging & Save Artifacts ---
+    print("Finishing W&B run and saving artifacts...")
+    if wandb.run and wandb.run.mode != "disabled": # Check if wandb was initialized successfully and not disabled
+        # Save model artifact to W&B
+        if model_save_path and os.path.exists(model_save_path):
+            model_artifact_name = f'joint-ae-model-{args.cancer_type}-{run_timestamp}'
+            artifact = wandb.Artifact(model_artifact_name, type='model', description=f"Trained Joint AE model for {args.cancer_type}")
+            artifact.add_file(model_save_path)
+            wandb.log_artifact(artifact)
+            print(f"Model artifact '{model_artifact_name}' saved to W&B")
+
+        # Save embeddings artifact
+        if embeddings_save_path and os.path.exists(embeddings_save_path):
+            embeddings_artifact_name = f'joint-ae-embeddings-{args.cancer_type}-{run_timestamp}'
+            embeddings_artifact = wandb.Artifact(embeddings_artifact_name, type='embeddings', description=f"Generated embeddings for {args.cancer_type}")
+            embeddings_artifact.add_file(embeddings_save_path)
+            wandb.log_artifact(embeddings_artifact)
+            print(f"Embeddings artifact '{embeddings_artifact_name}' saved to W&B")
+
+        # Finish Weave and W&B runs
+        # weave.finish() # finish() may not be needed if using wandb context
+        wandb.finish()
+    else:
+        print("WandB logging was disabled or failed to initialize. Skipping artifact saving.")
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train Joint Graph-Omics Autoencoder')
 
@@ -406,17 +530,19 @@ if __name__ == "__main__":
     parser.add_argument('--cancer_type', type=str, default='colorec', choices=['colorec', 'panc'],
                         help='Cancer type to train on')
     parser.add_argument('--modalities', type=str, default='rnaseq,methylation,scnv,miRNA',
-                        help='Comma-separated list of omics modalities to use')
+                        help='Comma-separated list of omics modalities to use (determines input tensor order)')
     parser.add_argument('--output_dir', type=str, default='./trained_models',
                         help='Directory to save trained models and embeddings')
     parser.add_argument('--log_dir', type=str, default='./logs', 
-                        help='Directory to save TensorBoard logs')
+                        help='Directory to save TensorBoard logs (No longer used if W&B is enabled)')
 
     # Model Hyperparameters
     parser.add_argument('--gene_embedding_dim', type=int, default=64,
                         help='Dimension of the latent gene embeddings (Z_gene)')
     parser.add_argument('--patient_embedding_dim', type=int, default=128,
                         help='Dimension of the latent patient embeddings (z_p)')
+    parser.add_argument('--modality_latents_path', type=str, default='config/modality_latents.json',
+                       help='Path to a JSON file defining latent dimensions for each modality')
     parser.add_argument('--graph_dropout', type=float, default=0.5,
                         help='Dropout rate for GCN layers in graph AE')
     parser.add_argument('--node_init_modality', type=str, default='identity',
@@ -465,5 +591,6 @@ if __name__ == "__main__":
         os.makedirs(args.output_dir)
     if args.log_dir and not os.path.exists(args.log_dir):
         os.makedirs(args.log_dir)
+
 
     train_joint_autoencoder(args) 
