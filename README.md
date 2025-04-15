@@ -43,10 +43,10 @@ kaggle datasets download progpug314/multiomics-preprocessed -p data/
 cd modelling/autoencoder
 
 # Run training for colorectal cancer data
-python train_joint_ae.py --cancer_type colorec --data_path ../../data/prepared_data_both.joblib --output_dir ../../trained_models
+python train_joint_ae.py --cancer_type colorec --data_path ../../data/prepared_data_both.joblib --output_dir ../../results/autoencoder
 
 # Run training for pancreatic cancer data
-python train_joint_ae.py --cancer_type panc --data_path ../../data/prepared_data_both.joblib --output_dir ../../trained_models
+python train_joint_ae.py --cancer_type panc --data_path ../../data/prepared_data_both.joblib --output_dir ../../results/autoencoder
 ```
 
 Additional training parameters:

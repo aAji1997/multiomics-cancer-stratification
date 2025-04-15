@@ -89,7 +89,7 @@ class InteractionGraphAutoencoder(nn.Module):
 # Modified Omics Processor (integrates Z_gene, encodes/decodes patient omics)
 class OmicsProcessor(nn.Module):
     def __init__(self, modality_latent_dims: dict, modality_order: list,
-                 gene_embedding_dim, patient_embedding_dim, num_genes):
+                 gene_embedding_dim, patient_embedding_dim, num_genes, gene_masks=None):
         """
         Args:
             modality_latent_dims (dict): Dictionary mapping modality name (str) to its desired latent dimension (int).
@@ -97,6 +97,7 @@ class OmicsProcessor(nn.Module):
             gene_embedding_dim (int): Dimension of Z_gene from the graph AE.
             patient_embedding_dim (int): Desired dimension for the final patient embedding (z_p).
             num_genes (int): Total number of genes.
+            gene_masks (dict, optional): Dictionary mapping modality names to binary masks (1 for originally present, 0 for added during harmonization).
         """
         super(OmicsProcessor, self).__init__()
         self.num_genes = num_genes
@@ -106,6 +107,7 @@ class OmicsProcessor(nn.Module):
         self.gene_embedding_dim = gene_embedding_dim
         self.patient_embedding_dim = patient_embedding_dim
         self.total_latent_dim = sum(modality_latent_dims.values())
+        self.gene_masks = gene_masks
 
         # Encoder Part
         # 1. Process per-gene omics modalities individually
@@ -214,6 +216,19 @@ class OmicsProcessor(nn.Module):
             mod_tensor = split_data[i] # Shape (B, N, 1)
             mod_encoder = self.modality_encoders[mod_name]
             latent_mod = mod_encoder(mod_tensor) # Shape (B, N, latent_dim)
+            
+            # Apply mask if available for this modality
+            if self.gene_masks is not None and mod_name in self.gene_masks:
+                # Create mask tensor and expand to match batch dimension
+                mask = torch.tensor(self.gene_masks[mod_name], 
+                                   dtype=latent_mod.dtype, 
+                                   device=latent_mod.device)
+                # Reshape mask to [1, num_genes, 1] for broadcasting
+                mask = mask.view(1, -1, 1)
+                # Apply mask - this focuses the model on originally present genes
+                # Values from added genes (mask=0) will not contribute to the latent representation
+                latent_mod = latent_mod * mask
+            
             latent_modality_tensors.append(latent_mod)
 
         # Concatenate latent modality tensors: -> (B, N, total_latent_dim)
@@ -228,9 +243,35 @@ class OmicsProcessor(nn.Module):
         # Process combined features per gene: -> (B, N, gene_combiner_out_dim)
         combined_gene_reps = self.gene_combiner(combined_features)
 
-        # 3. Aggregate across genes (simple mean pooling)
-        # (B, N, gene_combiner_out_dim) -> (B, gene_combiner_out_dim)
-        aggregated_rep = torch.mean(combined_gene_reps, dim=1)
+        # 3. Aggregate across genes with masked weighted pooling if masks are available
+        if self.gene_masks is not None:
+            # Create a combined mask across all modalities
+            # A gene is considered valid if it appears in ANY modality (logical OR)
+            combined_mask = None
+            for mod_name in self.modality_order:
+                if mod_name in self.gene_masks:
+                    mod_mask = torch.tensor(self.gene_masks[mod_name], 
+                                          dtype=torch.float, 
+                                          device=combined_gene_reps.device)
+                    if combined_mask is None:
+                        combined_mask = mod_mask
+                    else:
+                        combined_mask = torch.maximum(combined_mask, mod_mask)
+            
+            # If we have any valid masks, use weighted pooling
+            if combined_mask is not None:
+                # Reshape mask for broadcasting: [num_genes] -> [1, num_genes, 1]
+                combined_mask = combined_mask.view(1, -1, 1)
+                # Apply mask and compute weighted mean
+                masked_sum = (combined_gene_reps * combined_mask).sum(dim=1)
+                mask_sum = combined_mask.sum(dim=1) + 1e-8  # Avoid division by zero
+                aggregated_rep = masked_sum / mask_sum
+            else:
+                # Fallback to simple mean if no masks
+                aggregated_rep = torch.mean(combined_gene_reps, dim=1)
+        else:
+            # Original simple mean pooling if no masks
+            aggregated_rep = torch.mean(combined_gene_reps, dim=1)
 
         # 4. Final projection to patient embedding z_p
         # (B, gene_combiner_out_dim) -> (B, patient_embedding_dim)
@@ -298,7 +339,7 @@ class OmicsProcessor(nn.Module):
 # Joint Autoencoder Wrapper (Now incorporating VGAE for graph part)
 class JointAutoencoder(nn.Module):
     def __init__(self, num_nodes, modality_latent_dims: dict, modality_order: list,
-                 graph_feature_dim, gene_embedding_dim, patient_embedding_dim, graph_dropout=0.5):
+                 graph_feature_dim, gene_embedding_dim, patient_embedding_dim, graph_dropout=0.5, gene_masks=None):
         """
         Args:
             num_nodes (int): Number of genes.
@@ -308,6 +349,7 @@ class JointAutoencoder(nn.Module):
             gene_embedding_dim (int): Latent dimension for gene embeddings (Z_gene).
             patient_embedding_dim (int): Latent dimension for patient embeddings (z_p).
             graph_dropout (float): Dropout for the graph AE.
+            gene_masks (dict, optional): Dictionary mapping modality names to binary masks (1 for originally present, 0 for added).
         """
         super(JointAutoencoder, self).__init__()
         self.num_nodes = num_nodes # Store num_nodes for KL loss calculation later
@@ -321,7 +363,8 @@ class JointAutoencoder(nn.Module):
             modality_order=modality_order,
             gene_embedding_dim=gene_embedding_dim,
             patient_embedding_dim=patient_embedding_dim,
-            num_genes=num_nodes
+            num_genes=num_nodes,
+            gene_masks=gene_masks
         )
         
     def forward(self, graph_x, graph_edge_index, omics_x_structured, graph_edge_weight=None):

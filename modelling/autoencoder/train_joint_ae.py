@@ -145,6 +145,25 @@ def train_joint_autoencoder(args):
     gene_list = cancer_data['gene_list']
     num_genes = len(gene_list)
     
+    # ADDED: Extract gene masks if available
+    gene_masks = None
+    if 'gene_masks' in cancer_data:
+        gene_masks = cancer_data['gene_masks']
+        print(f"Loaded gene masks for modalities: {list(gene_masks.keys())}")
+        # Log mask statistics to wandb
+        if wandb.run and wandb.run.mode != "disabled":
+            for modality, mask in gene_masks.items():
+                present_count = sum(mask)
+                total_count = len(mask)
+                presence_ratio = present_count / total_count
+                wandb.log({
+                    f"Masks/{modality}/Present_Count": present_count,
+                    f"Masks/{modality}/Total_Count": total_count,
+                    f"Masks/{modality}/Presence_Ratio": presence_ratio
+                }, commit=False)
+    else:
+        print("No gene masks found in the data. Proceeding without masked training.")
+    
     # ADDED: Make adjacency matrix symmetric (undirected) to match GCN assumptions
     print("Making adjacency matrix symmetric (undirected)...")
     if sp.issparse(adj_matrix):
@@ -298,7 +317,8 @@ def train_joint_autoencoder(args):
         graph_feature_dim=graph_feature_dim,
         gene_embedding_dim=args.gene_embedding_dim,
         patient_embedding_dim=args.patient_embedding_dim,
-        graph_dropout=args.graph_dropout
+        graph_dropout=args.graph_dropout,
+        gene_masks=gene_masks # ADDED: Pass gene masks to model
     ).to(device)
 
     print("\nModel Architecture:")
@@ -313,8 +333,65 @@ def train_joint_autoencoder(args):
     wandb.watch(model, log="gradients", log_freq=args.log_interval * len(dataloader), log_graph=True)
 
     # --- Loss and Optimizer ---
-    # Omics Reconstruction Loss 
-    omics_loss_fn = F.mse_loss # Using functional version
+    # Omics Reconstruction Loss - Modified to handle gene masks
+    def masked_mse_loss(pred, target, masks=None, modality_order=None):
+        """
+        Calculate MSE loss with optional masking for originally present genes.
+        
+        Args:
+            pred: Predicted values [batch, genes, modalities]
+            target: Target values [batch, genes, modalities]
+            masks: Dict mapping modality name to mask array (1=originally present, 0=added during harmonization)
+            modality_order: List of modality names in the order they appear in tensor's last dimension
+            
+        Returns:
+            Masked MSE loss (considers original genes only if masks provided)
+        """
+        # If no masks or order info, use standard MSE
+        if masks is None or modality_order is None:
+            return F.mse_loss(pred, target)
+            
+        batch_size = pred.shape[0]
+        num_genes = pred.shape[1]
+        
+        # Create a combined tensor mask matching the input dimensions
+        tensor_mask = torch.ones_like(pred)
+        
+        # Apply different mask for each modality slice
+        for i, modality in enumerate(modality_order):
+            if modality in masks:
+                # Get the binary mask for this modality
+                mod_mask = torch.tensor(masks[modality], 
+                                      dtype=tensor_mask.dtype, 
+                                      device=tensor_mask.device)
+                # Reshape to [1, num_genes, 1] for broadcasting
+                mod_mask = mod_mask.view(1, -1, 1)
+                # Expand to match batch dimension if needed
+                mod_mask = mod_mask.expand(batch_size, -1, 1)
+                # Place in the correct position in the tensor mask using broadcasting
+                tensor_mask[:, :, i:i+1] = mod_mask
+                
+        # Calculate MSE only on masked elements (originally present genes)
+        squared_diff = (pred - target) ** 2
+        masked_squared_diff = squared_diff * tensor_mask
+        
+        # Get the sum of masked values and the count of mask elements
+        sum_squared_diff = masked_squared_diff.sum()
+        mask_sum = tensor_mask.sum()
+        
+        # Return mean MSE over masked elements only
+        if mask_sum > 0:
+            return sum_squared_diff / mask_sum
+        else:
+            # Fallback if no masked elements (should never happen)
+            return F.mse_loss(pred, target)
+    
+    # Use our masked MSE loss if gene_masks available, otherwise use standard MSE
+    if gene_masks:
+        print("Using masked MSE loss with focus on originally present genes")
+        omics_loss_fn = lambda pred, target: masked_mse_loss(pred, target, gene_masks, modality_order) 
+    else:
+        omics_loss_fn = F.mse_loss # Using functional version
 
     # Graph Reconstruction Loss 
     graph_loss_fn = nn.BCEWithLogitsLoss(reduction='mean', pos_weight=pos_weight_tensor)
@@ -531,7 +608,7 @@ if __name__ == "__main__":
                         help='Cancer type to train on')
     parser.add_argument('--modalities', type=str, default='rnaseq,methylation,scnv,miRNA',
                         help='Comma-separated list of omics modalities to use (determines input tensor order)')
-    parser.add_argument('--output_dir', type=str, default='./trained_models',
+    parser.add_argument('--output_dir', type=str, default='./results/autoencoder',
                         help='Directory to save trained models and embeddings')
     parser.add_argument('--log_dir', type=str, default='./logs', 
                         help='Directory to save TensorBoard logs (No longer used if W&B is enabled)')
