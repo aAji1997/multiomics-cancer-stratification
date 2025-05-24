@@ -1,10 +1,3 @@
-"""
-Risk stratification loss function for training models to separate patients into high and low risk groups.
-This loss function directly optimizes for log-rank scores by incorporating a differentiable approximation
-of the log-rank test statistic, along with encouraging the model to learn embeddings
-that can be effectively separated into distinct risk groups.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,22 +8,16 @@ import math
 class RiskStratificationLoss(nn.Module):
     """
     Loss function that encourages patient embeddings to form distinct clusters
-    that would yield good separation in survival analysis.
-
-    This loss directly optimizes for the log-rank test statistic by:
+    
     1. Clustering patient embeddings into two groups (high/low risk)
     2. Maximizing the distance between cluster centers
     3. Minimizing the variance within each cluster
     4. Encouraging balanced cluster sizes
-    5. Directly optimizing a differentiable approximation of the log-rank test statistic
-
     Args:
         balance_weight (float): Weight for the cluster balance term
         variance_weight (float): Weight for the within-cluster variance term
         separation_weight (float): Weight for the between-cluster separation term
-        logrank_weight (float): Weight for the log-rank approximation term
         temperature (float): Temperature parameter for soft clustering
-        survival_data (tuple, optional): Tuple of (times, events) for direct log-rank optimization
     """
     def __init__(self, balance_weight=0.2, variance_weight=0.2, separation_weight=0.2,
                  logrank_weight=0.4, temperature=0.1, survival_data=None):
@@ -45,82 +32,6 @@ class RiskStratificationLoss(nn.Module):
         # Initialize cluster centers (will be updated during forward pass)
         self.cluster_centers = None
 
-    def _differentiable_logrank_with_survival_data(self, cluster_probs, times, events):
-        """
-        Compute a more accurate differentiable approximation of the log-rank test statistic
-        when survival times and events are available.
-
-        This implementation is closer to the actual log-rank test used in survival analysis.
-
-        Args:
-            cluster_probs (torch.Tensor): Soft cluster assignment probabilities [batch_size, 2]
-            times (torch.Tensor): Survival times [batch_size]
-            events (torch.Tensor): Event indicators (1=event, 0=censored) [batch_size]
-
-        Returns:
-            torch.Tensor: Negative approximation of log-rank test statistic (to minimize)
-        """
-        device = cluster_probs.device
-
-        # Sort by time (ascending)
-        sorted_indices = torch.argsort(times)
-        sorted_times = times[sorted_indices]
-        sorted_events = events[sorted_indices]
-        sorted_probs = cluster_probs[sorted_indices]
-
-        # Get unique time points where events occurred
-        unique_times = torch.unique(sorted_times[sorted_events == 1])
-
-        # Initialize variables for log-rank calculation
-        observed_minus_expected = torch.zeros(1, device=device)
-        variance_sum = torch.zeros(1, device=device)
-
-        # For each time point, calculate the contribution to the log-rank statistic
-        for t in unique_times:
-            # Patients at risk at time t (patients with time >= t)
-            at_risk_mask = sorted_times >= t
-            n_at_risk = at_risk_mask.sum()
-
-            if n_at_risk < 2:
-                continue  # Skip if fewer than 2 patients at risk
-
-            # Events at time t
-            events_mask = (sorted_times == t) & (sorted_events == 1)
-            n_events = events_mask.sum()
-
-            if n_events == 0:
-                continue  # Skip if no events at this time
-
-            # Calculate weighted number of patients in group 0 at risk
-            n1_at_risk = torch.sum(sorted_probs[at_risk_mask, 0])
-
-            # Expected number of events in group 0
-            e1 = n_events * (n1_at_risk / n_at_risk)
-
-            # Observed number of events in group 0 (weighted by probability)
-            o1 = torch.sum(sorted_probs[events_mask, 0])
-
-            # Contribution to the log-rank statistic
-            diff = o1 - e1
-
-            # Variance calculation
-            n2_at_risk = n_at_risk - n1_at_risk  # Weighted number in group 1
-            variance = n_events * (n1_at_risk / n_at_risk) * (n2_at_risk / n_at_risk) * (n_at_risk - n_events) / (n_at_risk - 1 + 1e-8)
-
-            # Accumulate the difference and variance
-            observed_minus_expected += diff
-            variance_sum += variance
-
-        # Calculate the log-rank test statistic
-        # Higher values indicate better separation (lower p-values)
-        if variance_sum > 1e-8:
-            logrank_stat = (observed_minus_expected ** 2) / variance_sum
-        else:
-            # Fallback to a simpler approximation if variance is too small
-            logrank_stat = torch.abs(observed_minus_expected) + 1e-8
-
-        # Invert since we want to maximize the statistic but minimize the loss
-        return -logrank_stat
 
     def _differentiable_logrank_loss(self, cluster_probs):
         """
@@ -273,14 +184,6 @@ class RiskStratificationLoss(nn.Module):
                                     centers_for_forward[1].unsqueeze(1))
         separation_loss = torch.exp(-torch.clamp(1 - center_similarity, min=0))
 
-        # 3.4: Log-rank approximation loss - directly optimizes for log-rank test statistic
-        if self.survival_data is not None:
-            # If survival data is provided, use the more accurate approximation
-            times, events = self.survival_data
-            logrank_loss = self._differentiable_logrank_with_survival_data(cluster_probs, times, events)
-        else:
-            # Otherwise, use the basic approximation
-            logrank_loss = self._differentiable_logrank_loss(cluster_probs)
 
         # Ensure all loss components are scalar tensors
         if balance_loss.dim() > 0:
@@ -289,17 +192,15 @@ class RiskStratificationLoss(nn.Module):
             variance_loss = variance_loss.mean()
         if separation_loss.dim() > 0:
             separation_loss = separation_loss.mean()
-        if logrank_loss.dim() > 0:
-            logrank_loss = logrank_loss.mean()
+
 
         # Combine loss components without in-place operations
         weighted_balance = self.balance_weight * balance_loss
         weighted_variance = self.variance_weight * variance_loss
         weighted_separation = self.separation_weight * separation_loss
-        weighted_logrank = self.logrank_weight * logrank_loss
 
         # Sum the weighted components
-        total_loss = weighted_balance + weighted_variance + weighted_separation + weighted_logrank
+        total_loss = weighted_balance + weighted_variance + weighted_separation
 
         # Ensure the final loss is a scalar
         if total_loss.dim() > 0:
